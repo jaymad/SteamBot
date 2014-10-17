@@ -14,25 +14,29 @@ namespace SteamTrade
 {
     public class SteamWeb
     {
-
         public static string Fetch (string url, string method, NameValueCollection data = null, CookieContainer cookies = null, bool ajax = true)
         {
             HttpWebResponse response = Request (url, method, data, cookies, ajax);
-            StreamReader reader = new StreamReader (response.GetResponseStream ());
-            return reader.ReadToEnd ();
+            using(Stream responseStream = response.GetResponseStream())
+            {
+                using(StreamReader reader = new StreamReader(responseStream))
+                {
+                    return reader.ReadToEnd();
+                }
+            }
         }
 
-        public static HttpWebResponse Request (string url, string method, NameValueCollection data = null, CookieContainer cookies = null, bool ajax = true)
+        public static HttpWebResponse Request (string url, string method, NameValueCollection data = null, CookieContainer cookies = null, bool ajax = true, string referer = "")
         {
             HttpWebRequest request = WebRequest.Create (url) as HttpWebRequest;
 
             request.Method = method;
-
-            request.Accept = "text/javascript, text/html, application/xml, text/xml, */*";
+            request.Accept = "application/json, text/javascript;q=0.9, */*;q=0.5";
             request.ContentType = "application/x-www-form-urlencoded; charset=UTF-8";
-            request.Host = "steamcommunity.com";
-            request.UserAgent = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/536.11 (KHTML, like Gecko) Chrome/20.0.1132.47 Safari/536.11";
-            request.Referer = "http://steamcommunity.com/trade/1";
+            //request.Host is set automatically
+            request.UserAgent = "Mozilla/5.0 (Windows NT 6.1; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/31.0.1650.57 Safari/537.36";
+            request.Referer = string.IsNullOrEmpty(referer) ? "http://steamcommunity.com/trade/1" : referer;
+            request.Timeout = 50000; //Timeout after 50 seconds
 
             if (ajax)
             {
@@ -48,14 +52,15 @@ namespace SteamTrade
             {
                 string dataString = String.Join ("&", Array.ConvertAll (data.AllKeys, key =>
                     String.Format ("{0}={1}", HttpUtility.UrlEncode (key), HttpUtility.UrlEncode (data [key]))
-                )
-                );
+                ));
 
-                byte[] dataBytes = Encoding.ASCII.GetBytes (dataString);
+                byte[] dataBytes = Encoding.UTF8.GetBytes (dataString);
                 request.ContentLength = dataBytes.Length;
 
-                Stream requestStream = request.GetRequestStream ();
-                requestStream.Write (dataBytes, 0, dataBytes.Length);
+                using(Stream requestStream = request.GetRequestStream())
+                {
+                    requestStream.Write(dataBytes, 0, dataBytes.Length);
+                }
             }
 
             // Get the response
@@ -121,7 +126,7 @@ namespace SteamTrade
                     capText = Uri.EscapeDataString (Console.ReadLine ());
                 }
 
-                data.Add ("captcha_gid", captcha ? capGID : "");
+                data.Add ("captchagid", captcha ? capGID : "");
                 data.Add ("captcha_text", captcha ? capText : "");
                 // Captcha end
 
@@ -174,9 +179,9 @@ namespace SteamTrade
         /// This does the same as SteamWeb.DoLogin(), but without contacting the Steam Website.
         /// </summary> 
         /// <remarks>Should this one doesnt work anymore, use <see cref="SteamWeb.DoLogin"/></remarks>
-        public static bool Authenticate (SteamUser.LoginKeyCallback callback, SteamClient client, out string sessionId, out string token)
+        public static bool Authenticate(string myUniqueId, SteamClient client, out string sessionId, out string token, out string tokensecure, string myLoginKey)
         {
-            sessionId = Convert.ToBase64String (Encoding.UTF8.GetBytes (callback.UniqueID.ToString ()));
+            sessionId = Convert.ToBase64String (Encoding.UTF8.GetBytes (myUniqueId));
             
             using (dynamic userAuth = WebAPI.GetInterface ("ISteamUserAuth"))
             {
@@ -192,7 +197,7 @@ namespace SteamTrade
                 
                 
                 byte[] loginKey = new byte[20];
-                Array.Copy (Encoding.ASCII.GetBytes (callback.LoginKey), loginKey, callback.LoginKey.Length);
+                Array.Copy(Encoding.ASCII.GetBytes(myLoginKey), loginKey, myLoginKey.Length);
                 
                 // aes encrypt the loginkey with our session key
                 byte[] cryptedLoginKey = CryptoHelper.SymmetricEncrypt (loginKey, sessionKey);
@@ -205,18 +210,34 @@ namespace SteamTrade
                         steamid: client.SteamID.ConvertToUInt64 (),
                         sessionkey: HttpUtility.UrlEncode (cryptedSessionKey),
                         encrypted_loginkey: HttpUtility.UrlEncode (cryptedLoginKey),
-                        method: "POST"
+                        method: "POST",
+                        secure: true
                         );
                 }
                 catch (Exception)
                 {
                     token = null;
+                    tokensecure = null;
                     return false;
                 }
                 
                 token = authResult ["token"].AsString ();
+                tokensecure = authResult["tokensecure"].AsString();
                 
                 return true;
+            }
+        }
+
+        /// <summary>
+        /// Helper method to verify our precious cookies.
+        /// </summary>
+        /// <param name="cookies">CookieContainer with our cookies.</param>
+        /// <returns>true if cookies are correct; false otherwise</returns>
+        public static bool VerifyCookies(CookieContainer cookies)
+        {
+            using (HttpWebResponse response = Request("http://steamcommunity.com/", "HEAD", null, cookies))
+            {
+                return !(response.Cookies["steamLogin"] != null && response.Cookies["steamLogin"].Value.Equals("deleted"));
             }
         }
 

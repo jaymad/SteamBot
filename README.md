@@ -1,36 +1,35 @@
 **SteamBot** is a bot written in C# for the purpose of interacting with Steam Chat and Steam Trade.  As of right now, about 8 contributors have all added to the bot.  The bot is publicly available under the MIT License. Check out [LICENSE] for more details.
 
-**DO NOT DOWNLOAD THE ZIP FROM GITHUB!**
-
-This bot requires you use git to download the bot. *Downloading the zip will not work!* It doesn't work because the bot uses git submodules, which are not included with the zip download.
-
 There are several things you must do in order to get SteamBot working:
 
-1. Download the source using Git.
+1. Download the source.
 2. Compile the source code.
 3. Configure the bot (username, password, etc.).
 4. *Optionally*, customize the bot by changing the source code.
 
 ## Getting the Source
 
-**AGAIN: DO NOT DOWNLOAD THE ZIP FROM GITHUB!**
-
 Retrieving the source code should be done by following the [installation guide] on the wiki. The install guide covers the instructions needed to obtain the source code as well as the instructions for compiling the code.
 
 ## Configuring the Bot
 
-Next you need to actually edit the bot to make it do what you want. You can edit the files `SimpleUserHandler.cs` or `AdminUserHandler.cs` or you can create your very own `UserHandler`. See the [configuration guide] on the wiki. This guide covers configuring a basic bot as well as creating a custom user handler.
+See the [configuration guide] on the wiki. This guide covers configuring a basic bot as well as creating a custom user handler.
 
 ## Bot Administration
 
 While running the bots you may find it necessary to do some basic operations like shutting down and restarting a bot. The console will take some commands to allow you to do some this. See the [usage guide] for more information.
 
 ## More help?
-If it's a bug, open an Issue; if you have a fix, read [CONTRIBUTING.md] and open a Pull Request.  A list of contributors (add yourself if you want to):
+If it's a bug, open an Issue; if you have a fix, read [CONTRIBUTING.md] and open a Pull Request.  If it is a question about how to use SteamBot with your own bots, visit our subreddit at [/r/SteamBot](http://www.reddit.com/r/SteamBot). Please use the issue tracker only for bugs reports and pull requests. The subreddit should be used for all other  discussions.
+
+
+A list of contributors (add yourself if you want to):
 
 - [Jessecar96](http://steamcommunity.com/id/jessecar) (project lead)
 - [geel9](http://steamcommunity.com/id/geel9)
 - [cwhelchel](http://steamcommunity.com/id/cmw69krinkle)
+- [Lagg](http://lagg.me)
+- [BlueRaja](http://steamcommunity.com/id/BlueRaja/)
 
 ## Wanna Contribute?
 Please read [CONTRIBUTING.md].

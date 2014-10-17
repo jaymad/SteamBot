@@ -1,4 +1,5 @@
 using System;
+using System.Threading.Tasks;
 using System.Web;
 using System.Net;
 using System.Text;
@@ -7,9 +8,11 @@ using System.Threading;
 using System.Collections.Generic;
 using System.Security.Cryptography;
 using System.ComponentModel;
+using SteamBot.SteamGroups;
 using SteamKit2;
 using SteamTrade;
 using SteamKit2.Internal;
+using SteamTrade.TradeOffer;
 
 namespace SteamBot
 {
@@ -34,6 +37,7 @@ namespace SteamBot
         public SteamTrading SteamTrade;
         public SteamUser SteamUser;
         public SteamGameCoordinator SteamGameCoordinator;
+        public SteamNotifications SteamNotifications;
 
         // The current trade; if the bot is not in a trade, this is
         // null.
@@ -48,7 +52,15 @@ namespace SteamBot
         public UserHandlerCreator CreateHandler;
         Dictionary<ulong, UserHandler> userHandlers = new Dictionary<ulong, UserHandler>();
 
-        List<SteamID> friends = new List<SteamID>();
+        private List<SteamID> friends;
+        public IEnumerable<SteamID> FriendsList
+        {
+            get
+            {
+                CreateFriendsListIfNecessary();
+                return friends;
+            }
+        }
 
         // The maximum amount of time the bot will trade for.
         public int MaximumTradeTime { get; private set; }
@@ -61,7 +73,7 @@ namespace SteamBot
         public int CurrentGame = 0;
 
         // The Steam Web API key.
-        string apiKey;
+        public string apiKey;
 
         // The prefix put in the front of the bot's display name.
         string DisplayNamePrefix;
@@ -72,18 +84,33 @@ namespace SteamBot
         // The number, in milliseconds, between polls for the trade.
         int TradePollingInterval;
 
+        public string MyUserNonce;
+        public string MyUniqueId;
+
         string sessionId;
         string token;
+        string tokensecure;
+        bool CookiesAreInvalid = true;
+
         bool isprocess;
+        public bool IsRunning = false;
 
         public string AuthCode { get; set; }
 
         SteamUser.LogOnDetails logOnDetails;
 
         TradeManager tradeManager;
+        private TradeOfferManager tradeOfferManager;
+        private Task<Inventory> myInventoryTask;
 
-        public Inventory MyInventory;
-        public Inventory OtherInventory;
+        public Inventory MyInventory
+        {
+            get
+            {
+                myInventoryTask.Wait();
+                return myInventoryTask.Result;
+            }
+        }
 
         private BackgroundWorker backgroundWorker;
 
@@ -94,15 +121,16 @@ namespace SteamBot
                 Username = config.Username,
                 Password = config.Password
             };
-            DisplayName  = config.DisplayName;
+            DisplayName = config.DisplayName;
             ChatResponse = config.ChatResponse;
             MaximumTradeTime = config.MaximumTradeTime;
             MaximiumActionGap = config.MaximumActionGap;
             DisplayNamePrefix = config.DisplayNamePrefix;
             TradePollingInterval = config.TradePollingInterval <= 100 ? 800 : config.TradePollingInterval;
-            Admins       = config.Admins;
-            this.apiKey  = apiKey;
+            Admins = config.Admins;
+            this.apiKey = !String.IsNullOrEmpty(config.ApiKey) ? config.ApiKey : apiKey;
             this.isprocess = process;
+
             try
             {
                 LogLevel = (Log.LogLevel)Enum.Parse(typeof(Log.LogLevel), config.LogLevel, true);
@@ -112,24 +140,38 @@ namespace SteamBot
                 Console.WriteLine("Invalid LogLevel provided in configuration. Defaulting to 'INFO'");
                 LogLevel = Log.LogLevel.Info;
             }
-            log          = new Log (config.LogFile, this.DisplayName, LogLevel);
+            log = new Log(config.LogFile, this.DisplayName, LogLevel);
             CreateHandler = handlerCreator;
             BotControlClass = config.BotControlClass;
 
             // Hacking around https
             ServicePointManager.ServerCertificateValidationCallback += SteamWeb.ValidateRemoteCertificate;
 
-            log.Debug ("Initializing Steam Bot...");
+            log.Debug("Initializing Steam Bot...");
             SteamClient = new SteamClient();
+            SteamClient.AddHandler(new SteamNotifications());
             SteamTrade = SteamClient.GetHandler<SteamTrading>();
             SteamUser = SteamClient.GetHandler<SteamUser>();
             SteamFriends = SteamClient.GetHandler<SteamFriends>();
             SteamGameCoordinator = SteamClient.GetHandler<SteamGameCoordinator>();
+            SteamNotifications = SteamClient.GetHandler<SteamNotifications>();
 
             backgroundWorker = new BackgroundWorker { WorkerSupportsCancellation = true };
             backgroundWorker.DoWork += BackgroundWorkerOnDoWork;
             backgroundWorker.RunWorkerCompleted += BackgroundWorkerOnRunWorkerCompleted;
             backgroundWorker.RunWorkerAsync();
+        }
+
+        private void CreateFriendsListIfNecessary()
+        {
+            if (friends != null)
+                return;
+
+            friends = new List<SteamID>();
+            for (int i = 0; i < SteamFriends.GetFriendCount(); i++)
+            {
+                friends.Add(SteamFriends.GetFriendByIndex(i));
+            }
         }
 
         /// <summary>
@@ -149,6 +191,8 @@ namespace SteamBot
         /// <returns><c>true</c>. See remarks</returns>
         public bool StartBot()
         {
+            IsRunning = true;
+
             log.Info("Connecting...");
 
             if (!backgroundWorker.IsBusy)
@@ -156,7 +200,7 @@ namespace SteamBot
                 backgroundWorker.RunWorkerAsync();
 
             SteamClient.Connect();
-            
+
             log.Success("Done Loading Bot!");
 
             return true; // never get here
@@ -168,7 +212,9 @@ namespace SteamBot
         /// </summary>
         public void StopBot()
         {
-            log.Debug("Tryring to shut down bot thread.");
+            IsRunning = false;
+
+            log.Debug("Trying to shut down bot thread.");
             SteamClient.Disconnect();
 
             backgroundWorker.CancelAsync();
@@ -181,9 +227,9 @@ namespace SteamBot
         /// <c>true</c>, if trade was opened,
         /// <c>false</c> if there is another trade that must be closed first.
         /// </returns>
-        public bool OpenTrade (SteamID other)
+        public bool OpenTrade(SteamID other)
         {
-            if (CurrentTrade != null)
+            if (CurrentTrade != null || CheckCookies() == false)
                 return false;
 
             SteamTrade.Trade(other);
@@ -194,30 +240,67 @@ namespace SteamBot
         /// <summary>
         /// Closes the current active trade.
         /// </summary>
-        public void CloseTrade() 
+        public void CloseTrade()
         {
             if (CurrentTrade == null)
                 return;
 
-            UnsubscribeTrade (GetUserHandler (CurrentTrade.OtherSID), CurrentTrade);
+            UnsubscribeTrade(GetUserHandler(CurrentTrade.OtherSID), CurrentTrade);
 
-            tradeManager.StopTrade ();
+            tradeManager.StopTrade();
 
             CurrentTrade = null;
         }
 
-        void OnTradeTimeout(object sender, EventArgs args) 
+        void OnTradeTimeout(object sender, EventArgs args)
         {
             // ignore event params and just null out the trade.
-            GetUserHandler (CurrentTrade.OtherSID).OnTradeTimeout();
+            GetUserHandler(CurrentTrade.OtherSID).OnTradeTimeout();
         }
 
-        void OnTradeEnded (object sender, EventArgs e)
+        /// <summary>
+        /// Create a new trade offer with the specified partner
+        /// </summary>
+        /// <param name="other">SteamId of the partner</param>
+        /// <returns></returns>
+        public TradeOffer NewTradeOffer(SteamID other)
         {
-            CloseTrade();
-        }        
+            return tradeOfferManager.NewOffer(other);
+        }
 
-        bool HandleTradeSessionStart (SteamID other)
+        /// <summary>
+        /// Try to get a specific trade offer using the offerid
+        /// </summary>
+        /// <param name="offerId"></param>
+        /// <param name="tradeOffer"></param>
+        /// <returns></returns>
+        public bool TryGetTradeOffer(string offerId, out TradeOffer tradeOffer)
+        {
+            return tradeOfferManager.GetOffer(offerId, out tradeOffer);
+        }
+
+        public void HandleBotCommand(string command)
+        {
+            try
+            {
+                GetUserHandler(SteamClient.SteamID).OnBotCommand(command);
+            }
+            catch (ObjectDisposedException e)
+            {
+                // Writing to console because odds are the error was caused by a disposed log.
+                Console.WriteLine(string.Format("Exception caught in BotCommand Thread: {0}", e));
+                if (!this.IsRunning)
+                {
+                    Console.WriteLine("The Bot is no longer running and could not write to the log. Try Starting this bot first.");
+                }
+            }
+            catch (Exception e)
+            {
+                Console.WriteLine(string.Format("Exception caught in BotCommand Thread: {0}", e));
+            }
+        }
+
+        bool HandleTradeSessionStart(SteamID other)
         {
             if (CurrentTrade != null)
                 return false;
@@ -225,42 +308,42 @@ namespace SteamBot
             try
             {
                 tradeManager.InitializeTrade(SteamUser.SteamID, other);
-                CurrentTrade = tradeManager.StartTrade (SteamUser.SteamID, other);
+                CurrentTrade = tradeManager.CreateTrade(SteamUser.SteamID, other);
+                CurrentTrade.OnClose += CloseTrade;
+                SubscribeTrade(CurrentTrade, GetUserHandler(other));
+
+                tradeManager.StartTradeThread(CurrentTrade);
+                return true;
             }
             catch (SteamTrade.Exceptions.InventoryFetchException ie)
             {
                 // we shouldn't get here because the inv checks are also
                 // done in the TradeProposedCallback handler.
                 string response = String.Empty;
-                
+
                 if (ie.FailingSteamId.ConvertToUInt64() == other.ConvertToUInt64())
                 {
                     response = "Trade failed. Could not correctly fetch your backpack. Either the inventory is inaccessible or your backpack is private.";
                 }
-                else 
+                else
                 {
                     response = "Trade failed. Could not correctly fetch my backpack.";
                 }
-                
-                SteamFriends.SendChatMessage(other, 
+
+                SteamFriends.SendChatMessage(other,
                                              EChatEntryType.ChatMsg,
                                              response);
 
-                log.Info ("Bot sent other: " + response);
-                
+                log.Info("Bot sent other: " + response);
+
                 CurrentTrade = null;
                 return false;
             }
-            
-            CurrentTrade.OnClose += CloseTrade;
-            SubscribeTrade (CurrentTrade, GetUserHandler (other));
-
-            return true;
         }
 
         public void SetGamePlaying(int id)
         {
-            var gamePlaying = new ClientMsgProtobuf<CMsgClientGamesPlayed>(EMsg.ClientGamesPlayed);
+            var gamePlaying = new SteamKit2.ClientMsgProtobuf<CMsgClientGamesPlayed>(EMsg.ClientGamesPlayed);
 
             if (id != 0)
                 gamePlaying.Body.games_played.Add(new CMsgClientGamesPlayed.GamePlayed
@@ -273,14 +356,14 @@ namespace SteamBot
             CurrentGame = id;
         }
 
-        void HandleSteamMessage (CallbackMsg msg)
+        void HandleSteamMessage(CallbackMsg msg)
         {
             log.Debug(msg.ToString());
 
             #region Login
-            msg.Handle<SteamClient.ConnectedCallback> (callback =>
+            msg.Handle<SteamClient.ConnectedCallback>(callback =>
             {
-                log.Debug ("Connection Callback: " + callback.Result);
+                log.Debug("Connection Callback: " + callback.Result);
 
                 if (callback.Result == EResult.OK)
                 {
@@ -288,24 +371,28 @@ namespace SteamBot
                 }
                 else
                 {
-                    log.Error ("Failed to connect to Steam Community, trying again...");
-                    SteamClient.Connect ();
+                    log.Error("Failed to connect to Steam Community, trying again...");
+                    SteamClient.Connect();
                 }
 
             });
 
-            msg.Handle<SteamUser.LoggedOnCallback> (callback =>
+            msg.Handle<SteamUser.LoggedOnCallback>(callback =>
             {
-                log.Debug ("Logged On Callback: " + callback.Result);
+                log.Debug("Logged On Callback: " + callback.Result);
 
-                if (callback.Result != EResult.OK)
+                if (callback.Result == EResult.OK)
                 {
-                    log.Error ("Login Error: " + callback.Result);
+                    MyUserNonce = callback.WebAPIUserNonce;
+                }
+                else
+                {
+                    log.Error("Login Error: " + callback.Result);
                 }
 
                 if (callback.Result == EResult.AccountLogonDenied)
                 {
-                    log.Interface ("This account is SteamGuard enabled. Enter the code via the `auth' command.");
+                    log.Interface("This account is SteamGuard enabled. Enter the code via the `auth' command.");
 
                     // try to get the steamguard auth code from the event callback
                     var eva = new SteamGuardRequiredEventArgs();
@@ -323,43 +410,43 @@ namespace SteamBot
                 }
             });
 
-            msg.Handle<SteamUser.LoginKeyCallback> (callback =>
+            msg.Handle<SteamUser.LoginKeyCallback>(callback =>
             {
-                while (true)
-                {
-                    bool authd = SteamWeb.Authenticate(callback, SteamClient, out sessionId, out token);
-                    if (authd)
-                    {
-                        log.Success ("User Authenticated!");
+                MyUniqueId = callback.UniqueID.ToString();
 
-                        tradeManager = new TradeManager(apiKey, sessionId, token);
-                        tradeManager.SetTradeTimeLimits(MaximumTradeTime, MaximiumActionGap, TradePollingInterval);
-                        tradeManager.OnTimeout += OnTradeTimeout;
-                        tradeManager.OnTradeEnded += OnTradeEnded;
-                        break;
-                    }
-                    else
-                    {
-                        log.Warn ("Authentication failed, retrying in 2s...");
-                        Thread.Sleep (2000);
-                    }
-                }
+                UserWebLogOn();
 
                 if (Trade.CurrentSchema == null)
                 {
-                    log.Info ("Downloading Schema...");
-                    Trade.CurrentSchema = Schema.FetchSchema (apiKey);
-                    log.Success ("Schema Downloaded!");
+                    log.Info("Downloading Schema...");
+                    Trade.CurrentSchema = Schema.FetchSchema(apiKey);
+                    log.Success("Schema Downloaded!");
                 }
 
-                SteamFriends.SetPersonaName (DisplayNamePrefix+DisplayName);
-                SteamFriends.SetPersonaState (EPersonaState.Online);
+                SteamFriends.SetPersonaName(DisplayNamePrefix + DisplayName);
+                SteamFriends.SetPersonaState(EPersonaState.Online);
 
-                log.Success ("Steam Bot Logged In Completely!");
+                log.Success("Steam Bot Logged In Completely!");
 
                 IsLoggedIn = true;
 
                 GetUserHandler(SteamClient.SteamID).OnLoginCompleted();
+            });
+
+            msg.Handle<SteamClient.JobCallback<SteamUser.WebAPIUserNonceCallback>>(jobCallback =>
+            {
+                log.Debug("Received new WebAPIUserNonce.");
+
+                if (jobCallback.Callback.Result == EResult.OK)
+                {
+                    MyUserNonce = jobCallback.Callback.Nonce;
+
+                    UserWebLogOn();
+                }
+                else
+                {
+                    log.Error("WebAPIUserNonce Error: " + jobCallback.Callback.Result);
+                }
             });
 
             // handle a special JobCallback differently than the others
@@ -372,39 +459,67 @@ namespace SteamBot
             #endregion
 
             #region Friends
-            msg.Handle<SteamFriends.FriendsListCallback> (callback =>
+            msg.Handle<SteamFriends.FriendsListCallback>(callback =>
             {
                 foreach (SteamFriends.FriendsListCallback.Friend friend in callback.FriendList)
                 {
-                    if (!friends.Contains(friend.SteamID))
+                    switch (friend.SteamID.AccountType)
                     {
-                        friends.Add(friend.SteamID);
-                        if (friend.Relationship == EFriendRelationship.PendingInvitee &&
-                            GetUserHandler(friend.SteamID).OnFriendAdd())
-                        {
-                            SteamFriends.AddFriend(friend.SteamID);
-                        }
-                    }
-                    else
-                    {
-                        if (friend.Relationship == EFriendRelationship.None)
-                        {
-                            friends.Remove(friend.SteamID);
-                            GetUserHandler(friend.SteamID).OnFriendRemove();
-                        }
+                        case EAccountType.Clan:
+                            if (friend.Relationship == EFriendRelationship.RequestRecipient)
+                            {
+                                if (GetUserHandler(friend.SteamID).OnGroupAdd())
+                                {
+                                    AcceptGroupInvite(friend.SteamID);
+                                }
+                                else
+                                {
+                                    DeclineGroupInvite(friend.SteamID);
+                                }
+                            }
+                            break;
+                        default:
+                            CreateFriendsListIfNecessary();
+                            if (friend.Relationship == EFriendRelationship.None)
+                            {
+                                friends.Remove(friend.SteamID);
+                                GetUserHandler(friend.SteamID).OnFriendRemove();
+                                RemoveUserHandler(friend.SteamID);
+                            }
+                            else if (friend.Relationship == EFriendRelationship.RequestRecipient)
+                            {
+                                if (GetUserHandler(friend.SteamID).OnFriendAdd())
+                                {
+                                    if(!friends.Contains(friend.SteamID))
+                                    {
+                                        friends.Add(friend.SteamID);
+                                    }
+                                    else
+                                    {
+                                        log.Error("Friend was added who was already in friends list: " + friend.SteamID);
+                                    }
+                                    SteamFriends.AddFriend(friend.SteamID);
+                                }
+                                else
+                                {
+                                    SteamFriends.RemoveFriend(friend.SteamID);
+                                    RemoveUserHandler(friend.SteamID);
+                                }
+                            }
+                            break;
                     }
                 }
             });
 
-            msg.Handle<SteamFriends.FriendMsgCallback> (callback =>
+
+            msg.Handle<SteamFriends.FriendMsgCallback>(callback =>
             {
                 EChatEntryType type = callback.EntryType;
 
-                if (callback.EntryType == EChatEntryType.ChatMsg ||
-                    callback.EntryType == EChatEntryType.Emote)
+                if (callback.EntryType == EChatEntryType.ChatMsg)
                 {
-                    log.Info (String.Format ("Chat Message from {0}: {1}",
-                                         SteamFriends.GetFriendPersonaName (callback.Sender),
+                    log.Info(String.Format("Chat Message from {0}: {1}",
+                                         SteamFriends.GetFriendPersonaName(callback.Sender),
                                          callback.Message
                                          ));
                     GetUserHandler(callback.Sender).OnMessage(callback.Message, type);
@@ -420,77 +535,121 @@ namespace SteamBot
             #endregion
 
             #region Trading
-            msg.Handle<SteamTrading.SessionStartCallback> (callback =>
+            msg.Handle<SteamTrading.SessionStartCallback>(callback =>
             {
-                bool started = HandleTradeSessionStart (callback.OtherClient);
+                bool started = HandleTradeSessionStart(callback.OtherClient);
 
                 if (!started)
-                    log.Error ("Could not start the trade session.");
+                    log.Error("Could not start the trade session.");
                 else
-                    log.Debug ("SteamTrading.SessionStartCallback handled successfully. Trade Opened.");
+                    log.Debug("SteamTrading.SessionStartCallback handled successfully. Trade Opened.");
             });
 
-            msg.Handle<SteamTrading.TradeProposedCallback> (callback =>
+            msg.Handle<SteamTrading.TradeProposedCallback>(callback =>
             {
+                if (CheckCookies() == false)
+                {
+                    SteamTrade.RespondToTrade(callback.TradeID, false);
+                    return;
+                }
+
                 try
                 {
                     tradeManager.InitializeTrade(SteamUser.SteamID, callback.OtherClient);
                 }
-                catch 
+                catch (WebException we)
                 {
-                    SteamFriends.SendChatMessage(callback.OtherClient, 
-                                                 EChatEntryType.ChatMsg,
-                                                 "Trade declined. Could not correctly fetch your backpack.");
-                    
-                    SteamTrade.RespondToTrade (callback.TradeID, false);
+                    SteamFriends.SendChatMessage(callback.OtherClient,
+                             EChatEntryType.ChatMsg,
+                             "Trade error: " + we.Message);
+
+                    SteamTrade.RespondToTrade(callback.TradeID, false);
+                    return;
+                }
+                catch (Exception)
+                {
+                    SteamFriends.SendChatMessage(callback.OtherClient,
+                             EChatEntryType.ChatMsg,
+                             "Trade declined. Could not correctly fetch your backpack.");
+
+                    SteamTrade.RespondToTrade(callback.TradeID, false);
                     return;
                 }
 
-                if (tradeManager.OtherInventory.IsPrivate)
-                {
-                    SteamFriends.SendChatMessage(callback.OtherClient, 
-                                                 EChatEntryType.ChatMsg,
-                                                 "Trade declined. Your backpack cannot be private.");
+                //if (tradeManager.OtherInventory.IsPrivate)
+                //{
+                //    SteamFriends.SendChatMessage(callback.OtherClient, 
+                //                                 EChatEntryType.ChatMsg,
+                //                                 "Trade declined. Your backpack cannot be private.");
 
-                    SteamTrade.RespondToTrade (callback.TradeID, false);
-                    return;
-                }
+                //    SteamTrade.RespondToTrade (callback.TradeID, false);
+                //    return;
+                //}
 
-                if (CurrentTrade == null && GetUserHandler (callback.OtherClient).OnTradeRequest ())
-                    SteamTrade.RespondToTrade (callback.TradeID, true);
+                if (CurrentTrade == null && GetUserHandler(callback.OtherClient).OnTradeRequest())
+                    SteamTrade.RespondToTrade(callback.TradeID, true);
                 else
-                    SteamTrade.RespondToTrade (callback.TradeID, false);
+                    SteamTrade.RespondToTrade(callback.TradeID, false);
             });
 
-            msg.Handle<SteamTrading.TradeResultCallback> (callback =>
+            msg.Handle<SteamTrading.TradeResultCallback>(callback =>
             {
                 if (callback.Response == EEconTradeResponse.Accepted)
                 {
-                    log.Debug ("Trade Status: " + callback.Response);
-                    log.Info ("Trade Accepted!");
+                    log.Debug("Trade Status: " + callback.Response);
+                    log.Info("Trade Accepted!");
+                    GetUserHandler(callback.OtherClient).OnTradeRequestReply(true, callback.Response.ToString());
                 }
                 else
                 {
-                    log.Warn ("Trade failed: " + callback.Response);
-                    CloseTrade ();
+                    log.Warn("Trade failed: " + callback.Response);
+                    CloseTrade();
+                    GetUserHandler(callback.OtherClient).OnTradeRequestReply(false, callback.Response.ToString());
                 }
 
             });
             #endregion
 
             #region Disconnect
-            msg.Handle<SteamUser.LoggedOffCallback> (callback =>
+            msg.Handle<SteamUser.LoggedOffCallback>(callback =>
             {
                 IsLoggedIn = false;
-                log.Warn ("Logged Off: " + callback.Result);
+                log.Warn("Logged Off: " + callback.Result);
             });
 
-            msg.Handle<SteamClient.DisconnectedCallback> (callback =>
+            msg.Handle<SteamClient.DisconnectedCallback>(callback =>
             {
                 IsLoggedIn = false;
-                CloseTrade ();
-                log.Warn ("Disconnected from Steam Network!");
-                SteamClient.Connect ();
+                CloseTrade();
+                log.Warn("Disconnected from Steam Network!");
+                SteamClient.Connect();
+            });
+            #endregion
+
+            #region Notifications
+            msg.Handle<SteamBot.SteamNotifications.NotificationCallback>(callback =>
+            {
+                //currently only appears to be of trade offer
+                if (callback.Notifications.Count != 0)
+                {
+                    foreach (var notification in callback.Notifications)
+                    {
+                        log.Info(notification.UserNotificationType + " notification");
+                    }
+                }
+
+                // Get offers only if cookies are valid
+                if (CheckCookies())
+                    tradeOfferManager.GetOffers();
+            });
+
+            msg.Handle<SteamBot.SteamNotifications.CommentNotificationCallback>(callback =>
+            {
+                //various types of comment notifications on profile/activity feed etc
+                //log.Info("received CommentNotificationCallback");
+                //log.Info("New Commments " + callback.CommentNotifications.CountNewComments);
+                //log.Info("New Commments Owners " + callback.CommentNotifications.CountNewCommentsOwner);
+                //log.Info("New Commments Subscriptions" + callback.CommentNotifications.CountNewCommentsSubscriptions);
             });
             #endregion
         }
@@ -499,7 +658,8 @@ namespace SteamBot
         {
             // get sentry file which has the machine hw info saved 
             // from when a steam guard code was entered
-            FileInfo fi = new FileInfo(String.Format("{0}.sentryfile", logOnDetails.Username));
+            Directory.CreateDirectory(System.IO.Path.Combine(System.Windows.Forms.Application.StartupPath, "sentryfiles"));
+            FileInfo fi = new FileInfo(System.IO.Path.Combine("sentryfiles", String.Format("{0}.sentryfile", logOnDetails.Username)));
 
             if (fi.Exists && fi.Length > 0)
                 logOnDetails.SentryFileHash = SHAHash(File.ReadAllBytes(fi.FullName));
@@ -509,51 +669,132 @@ namespace SteamBot
             SteamUser.LogOn(logOnDetails);
         }
 
-        UserHandler GetUserHandler (SteamID sid)
+        void UserWebLogOn()
         {
-            if (!userHandlers.ContainsKey (sid))
+            while (true)
             {
-                userHandlers [sid.ConvertToUInt64 ()] = CreateHandler (this, sid);
+                bool authd = SteamWeb.Authenticate(MyUniqueId, SteamClient, out sessionId, out token, out tokensecure, MyUserNonce);
+
+                if (authd)
+                {
+                    log.Success("User Authenticated!");
+
+                    tradeManager = new TradeManager(apiKey, sessionId, token);
+                    tradeManager.SetTradeTimeLimits(MaximumTradeTime, MaximiumActionGap, TradePollingInterval);
+                    tradeManager.OnTimeout += OnTradeTimeout;
+
+                    tradeOfferManager = new TradeOfferManager(apiKey, sessionId, token, tokensecure);
+                    SubscribeTradeOffer(tradeOfferManager);
+
+                    CookiesAreInvalid = false;
+
+                    // Success, check trade offers which we have received while we were offline
+                    tradeOfferManager.GetOffers();
+
+                    break;
+                }
+                else
+                {
+                    log.Warn("Authentication failed, retrying in 2s...");
+                    Thread.Sleep(2000);
+                }
             }
-            return userHandlers [sid.ConvertToUInt64 ()];
         }
 
-        static byte [] SHAHash (byte[] input)
+        /// <summary>
+        /// Checks if sessionId and token cookies are still valid.
+        /// Sets cookie flag if they are invalid.
+        /// </summary>
+        /// <returns>true if cookies are valid; otherwise false</returns>
+        bool CheckCookies()
+        {
+            // We still haven't re-authenticated
+            if (CookiesAreInvalid)
+                return false;
+
+            // Construct cookie container
+            CookieContainer cookies = new CookieContainer();
+            cookies.Add(new Cookie("sessionid", sessionId, String.Empty, "steamcommunity.com"));
+            cookies.Add(new Cookie("steamLogin", token, String.Empty, "steamcommunity.com"));
+
+            try
+            {
+                if (!SteamWeb.VerifyCookies(cookies))
+                {
+                    // Cookies are no longer valid
+                    log.Warn("Cookies are invalid. Need to re-authenticate.");
+                    CookiesAreInvalid = true;
+                    SteamUser.RequestWebAPIUserNonce();
+                    return false;
+                }
+                else
+                {
+                    return true;
+                }
+            }
+            catch
+            {
+                // Even if exception is caught, we should still continue.
+                log.Warn("Cookie check failed. http://steamcommunity.com is possibly down.");
+                return true;
+            }
+        }
+
+        UserHandler GetUserHandler(SteamID sid)
+        {
+            if (!userHandlers.ContainsKey(sid))
+            {
+                userHandlers[sid.ConvertToUInt64()] = CreateHandler(this, sid);
+            }
+            return userHandlers[sid.ConvertToUInt64()];
+        }
+
+        void RemoveUserHandler(SteamID sid)
+        {
+            if (userHandlers.ContainsKey(sid))
+            {
+                userHandlers.Remove(sid);
+            }
+        }
+
+        static byte[] SHAHash(byte[] input)
         {
             SHA1Managed sha = new SHA1Managed();
-            
-            byte[] output = sha.ComputeHash( input );
-            
+
+            byte[] output = sha.ComputeHash(input);
+
             sha.Clear();
-            
+
             return output;
         }
 
-        void OnUpdateMachineAuthCallback (SteamUser.UpdateMachineAuthCallback machineAuth, JobID jobId)
+        void OnUpdateMachineAuthCallback(SteamUser.UpdateMachineAuthCallback machineAuth, JobID jobId)
         {
-            byte[] hash = SHAHash (machineAuth.Data);
+            byte[] hash = SHAHash(machineAuth.Data);
 
-            File.WriteAllBytes (String.Format ("{0}.sentryfile", logOnDetails.Username), machineAuth.Data);
-            
+            Directory.CreateDirectory(System.IO.Path.Combine(System.Windows.Forms.Application.StartupPath, "sentryfiles"));
+
+            File.WriteAllBytes(System.IO.Path.Combine("sentryfiles", String.Format("{0}.sentryfile", logOnDetails.Username)), machineAuth.Data);
+
             var authResponse = new SteamUser.MachineAuthDetails
             {
                 BytesWritten = machineAuth.BytesToWrite,
                 FileName = machineAuth.FileName,
                 FileSize = machineAuth.BytesToWrite,
                 Offset = machineAuth.Offset,
-                
+
                 SentryFileHash = hash, // should be the sha1 hash of the sentry file we just wrote
-                
+
                 OneTimePassword = machineAuth.OneTimePassword, // not sure on this one yet, since we've had no examples of steam using OTPs
-                
+
                 LastError = 0, // result from win32 GetLastError
                 Result = EResult.OK, // if everything went okay, otherwise ~who knows~
-                
+
                 JobID = jobId, // so we respond to the correct server job
             };
-            
+
             // send off our response
-            SteamUser.SendMachineAuthResponse (authResponse);
+            SteamUser.SendMachineAuthResponse(authResponse);
         }
 
         /// <summary>
@@ -573,60 +814,61 @@ namespace SteamBot
         /// </example>
         public void GetInventory()
         {
-            MyInventory = Inventory.FetchInventory(SteamUser.SteamID, apiKey);
+            myInventoryTask = Task.Factory.StartNew(() => Inventory.FetchInventory(SteamUser.SteamID, apiKey));
         }
 
-        /// <summary>
-        /// Gets the other user's inventory and stores it in OtherInventory.
-        /// </summary>
-        /// <param name="OtherSID">The SteamID of the other user</param>
-        /// <example> This sample shows how to find items in the other user's inventory from a user handler.
-        /// <code>
-        /// Bot.GetOtherInventory(OtherSID); // Get the inventory first
-        /// foreach (var item in Bot.OtherInventory.Items)
-        /// {
-        ///     if (item.Defindex == 5021)
-        ///     {
-        ///         // User has a key in its inventory
-        ///     }
-        /// }
-        /// </code>
-        /// </example>
-        public void GetOtherInventory(SteamID OtherSID)
+        public void TradeOfferRouter(TradeOffer offer)
         {
-            OtherInventory = Inventory.FetchInventory(OtherSID, apiKey);
+            if (offer.OfferState == TradeOfferState.TradeOfferStateActive)
+            {
+                GetUserHandler(offer.PartnerSteamId).OnNewTradeOffer(offer);
+            }
+        }
+        public void SubscribeTradeOffer(TradeOfferManager tradeOfferManager)
+        {
+            tradeOfferManager.OnNewTradeOffer += TradeOfferRouter;
+        }
+
+        //todo: should unsubscribe eventually...
+        public void UnsubscribeTradeOffer(TradeOfferManager tradeOfferManager)
+        {
+            tradeOfferManager.OnNewTradeOffer -= TradeOfferRouter;
         }
 
         /// <summary>
         /// Subscribes all listeners of this to the trade.
         /// </summary>
-        public void SubscribeTrade (Trade trade, UserHandler handler)
+        public void SubscribeTrade(Trade trade, UserHandler handler)
         {
+            trade.OnSuccess += handler.OnTradeSuccess;
             trade.OnClose += handler.OnTradeClose;
             trade.OnError += handler.OnTradeError;
+            trade.OnStatusError += handler.OnStatusError;
             //trade.OnTimeout += OnTradeTimeout;
             trade.OnAfterInit += handler.OnTradeInit;
             trade.OnUserAddItem += handler.OnTradeAddItem;
             trade.OnUserRemoveItem += handler.OnTradeRemoveItem;
             trade.OnMessage += handler.OnTradeMessage;
-            trade.OnUserSetReady += handler.OnTradeReady;
-            trade.OnUserAccept += handler.OnTradeAccept;
+            trade.OnUserSetReady += handler.OnTradeReadyHandler;
+            trade.OnUserAccept += handler.OnTradeAcceptHandler;
         }
-        
+
         /// <summary>
         /// Unsubscribes all listeners of this from the current trade.
         /// </summary>
-        public void UnsubscribeTrade (UserHandler handler, Trade trade)
+        public void UnsubscribeTrade(UserHandler handler, Trade trade)
         {
+            trade.OnSuccess -= handler.OnTradeSuccess;
             trade.OnClose -= handler.OnTradeClose;
             trade.OnError -= handler.OnTradeError;
+            trade.OnStatusError -= handler.OnStatusError;
             //Trade.OnTimeout -= OnTradeTimeout;
             trade.OnAfterInit -= handler.OnTradeInit;
             trade.OnUserAddItem -= handler.OnTradeAddItem;
             trade.OnUserRemoveItem -= handler.OnTradeRemoveItem;
             trade.OnMessage -= handler.OnTradeMessage;
-            trade.OnUserSetReady -= handler.OnTradeReady;
-            trade.OnUserAccept -= handler.OnTradeAccept;
+            trade.OnUserSetReady -= handler.OnTradeReadyHandler;
+            trade.OnUserAccept -= handler.OnTradeAcceptHandler;
         }
 
         #region Background Worker Methods
@@ -655,10 +897,25 @@ namespace SteamBot
 
         private void BackgroundWorkerOnDoWork(object sender, DoWorkEventArgs doWorkEventArgs)
         {
+            CallbackMsg msg;
+
             while (!backgroundWorker.CancellationPending)
             {
-                CallbackMsg msg = SteamClient.WaitForCallback(true);
-                HandleSteamMessage(msg);
+                try
+                {
+                    msg = SteamClient.WaitForCallback(true);
+                    HandleSteamMessage(msg);
+                }
+                catch (WebException e)
+                {
+                    log.Error("URI: " + (e.Response != null && e.Response.ResponseUri != null ? e.Response.ResponseUri.ToString() : "unknown") + " >> " + e.ToString());
+                    System.Threading.Thread.Sleep(45000);//Steam is down, retry in 45 seconds.
+                }
+                catch (Exception e)
+                {
+                    log.Error(e.ToString());
+                    log.Warn("Restarting bot...");
+                }
             }
         }
 
@@ -674,26 +931,66 @@ namespace SteamBot
                 handler(this, e);
             else
             {
-                if (!this.isprocess)
+                while (true)
                 {
-                    while (true)
+                    if (this.AuthCode != null)
                     {
-                        if (this.AuthCode != null)
-                        {
-                            e.SteamGuard = this.AuthCode;
-                            break;
-                        }
-
-                        Thread.Sleep(5);
+                        e.SteamGuard = this.AuthCode;
+                        break;
                     }
-                }
-                else
-                {
-                    // Apparently we're a process. So read in the code from stdin.
-                    this.AuthCode = Console.ReadLine();
-                    e.SteamGuard = this.AuthCode;
+
+                    Thread.Sleep(5);
                 }
             }
         }
+
+        #region Group Methods
+
+        /// <summary>
+        /// Accepts the invite to a Steam Group
+        /// </summary>
+        /// <param name="group">SteamID of the group to accept the invite from.</param>
+        private void AcceptGroupInvite(SteamID group)
+        {
+            var AcceptInvite = new ClientMsg<CMsgGroupInviteAction>((int)EMsg.ClientAcknowledgeClanInvite);
+
+            AcceptInvite.Body.GroupID = group.ConvertToUInt64();
+            AcceptInvite.Body.AcceptInvite = true;
+
+            this.SteamClient.Send(AcceptInvite);
+
+        }
+
+        /// <summary>
+        /// Declines the invite to a Steam Group
+        /// </summary>
+        /// <param name="group">SteamID of the group to decline the invite from.</param>
+        private void DeclineGroupInvite(SteamID group)
+        {
+            var DeclineInvite = new ClientMsg<CMsgGroupInviteAction>((int)EMsg.ClientAcknowledgeClanInvite);
+
+            DeclineInvite.Body.GroupID = group.ConvertToUInt64();
+            DeclineInvite.Body.AcceptInvite = false;
+
+            this.SteamClient.Send(DeclineInvite);
+        }
+
+        /// <summary>
+        /// Invites a use to the specified Steam Group
+        /// </summary>
+        /// <param name="user">SteamID of the user to invite.</param>
+        /// <param name="groupId">SteamID of the group to invite the user to.</param>
+        public void InviteUserToGroup(SteamID user, SteamID groupId)
+        {
+            var InviteUser = new ClientMsg<CMsgInviteUserToGroup>((int)EMsg.ClientInviteUserToClan);
+
+            InviteUser.Body.GroupID = groupId.ConvertToUInt64();
+            InviteUser.Body.Invitee = user.ConvertToUInt64();
+            InviteUser.Body.UnknownInfo = true;
+
+            this.SteamClient.Send(InviteUser);
+        }
+
+        #endregion
     }
 }
